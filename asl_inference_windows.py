@@ -296,6 +296,10 @@ def main():
                         n = len(sequence_buffer)
                         if n >= MIN_FRAMES:
                             seq = np.stack(list(sequence_buffer), axis=0)
+                            # === DEBUG: save sequence to disk ===
+                            np.save("test_sequence_pc.npy", seq)
+                            print(f"[Debug] saved seq shape={seq.shape}, "
+                                f"NaN ratio={np.isnan(seq).mean():.3f}")
                             t_inf = time.time()
                             last_predictions = classifier.predict(seq, top_k=3)
                             inf_ms = (time.time() - t_inf) * 1000
