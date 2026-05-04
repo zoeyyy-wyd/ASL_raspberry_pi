@@ -12,9 +12,14 @@ Hotkeys:
   - 'q'/ESC  : quit
 
 Setup (Raspberry Pi OS 64-bit, Bookworm):
-  python3 -m venv myenv --system-site-packages
-  source myenv/bin/activate
-  pip install mediapipe opencv-python tflite-runtime
+  python3 -m venv asl --system-site-packages
+  source asl/bin/activate
+  pip install mediapipe opencv-python ai-edge-litert
+
+  NOTE: We use ai-edge-litert (Google's renamed TFLite runtime) instead of
+  the older tflite-runtime. The older tflite-runtime 2.14 on ARM has a bug
+  where NaN values in the input cause logits to become NaN. ai-edge-litert
+  handles NaN correctly, matching the reference implementation on x86.
 
 Usage:
   python asl_inference_rpi.py
@@ -33,17 +38,14 @@ import numpy as np
 import mediapipe as mp
 from picamera2 import Picamera2
 
-# Prefer the lightweight tflite-runtime; fall back to full TensorFlow if needed
-try:
-    from tflite_runtime.interpreter import Interpreter
-    print("[Info] Using tflite_runtime.Interpreter")
-except ImportError:
-    import tensorflow as tf
-    Interpreter = tf.lite.Interpreter
-    print("[Info] Using tensorflow.lite.Interpreter")
+# Use ai-edge-litert (Google's new name for tflite-runtime).
+# This package correctly handles NaN inputs on ARM, unlike the older
+# tflite-runtime which produced all-NaN outputs for the GISLR model.
+from ai_edge_litert.interpreter import Interpreter
+print("[Info] Using ai_edge_litert.Interpreter")
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------yyuuh  --
 # Constants - must match the training pipeline of the GISLR 1st place model
 # -----------------------------------------------------------------------------
 ROWS_PER_FRAME = 543
@@ -227,7 +229,7 @@ def main():
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--threads", type=int, default=4,
                         help="TFLite CPU threads (Pi 5 has 4 cores)")
-    parser.add_argument("--complexity", type=int, default=0, choices=[0, 1, 2],
+    parser.add_argument("--complexity", type=int, default=1, choices=[0, 1, 2],
                         help="MediaPipe model complexity (0=lite, 1=full, 2=heavy)")
     parser.add_argument("--no-display", action="store_true",
                         help="Run headless (no GUI window). Useful for SSH.")
@@ -332,7 +334,8 @@ def main():
                             last_predictions = classifier.predict(seq, top_k=3)
                             inf_ms = (time.time() - t_inf) * 1000
                             result_time = time.time()
-                            print(f"\n[Inference] {n} frames in {inf_ms:.1f} ms")
+                            print(f"\n[Inference] {n} frames in {inf_ms:.1f} ms "
+                                  f"(NaN ratio: {np.isnan(seq).mean():.3f})")
                             for name, prob in last_predictions:
                                 print(f"  {name:25s}  {prob * 100:5.1f}%")
                             print()

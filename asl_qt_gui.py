@@ -1,34 +1,21 @@
 """
-ASL Sign Language Recognition - Raspberry Pi PyQt5 Desktop GUI
+ASL Sign Language Recognition - Raspberry Pi PyQt5 (simplified)
 
-Layout:
+Layout (designed for ~800x480 small screens, fullscreen):
   +-------------------------------------------------+
-  | [STATUS PILL]                          [FPS]    |
   |                                                 |
-  |              ┌───────────────┐                  |
-  |              │    HELLO      │  <- big result   |
-  |              │    87%        │                  |
-  |              └───────────────┘                  |
-  |    bye 8%   hi 3%                               |
+  |         [ BIG CAMERA PREVIEW ]                  |
   |                                                 |
-  |    ┌── camera preview (small) ───┐              |
-  |    │                             │              |
-  |    └─────────────────────────────┘              |
+  |   ┌──────────── overlays ───────────┐           |
+  |   │ WAITING                FPS 12.3 │           |
+  |   └─────────────────────────────────┘           |
   |                                                 |
-  |   SENTENCE                                      |
-  |   ┌──────────────────────────────────────────┐  |
-  |   │ hello mom drink water                    │  |
-  |   └──────────────────────────────────────────┘  |
-  |   [Cancel] [Backspace] [Clear] [Copy]           |
+  |   ┌──── HELLO  87% ────┐                        |
+  |   └────────────────────┘                        |
+  |                                                 |
+  |   sentence: hello mom drink                     |
+  |   [Backspace] [Clear] [Quit]                    |
   +-------------------------------------------------+
-
-Setup (Raspberry Pi):
-  source myenv/bin/activate
-  sudo apt install python3-pyqt5
-
-Usage:
-  python asl_qt_gui.py
-  python asl_qt_gui.py --fullscreen   # for the Pi touchscreen
 """
 
 import argparse
@@ -44,19 +31,13 @@ import mediapipe as mp
 from picamera2 import Picamera2
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-    QVBoxLayout, QHBoxLayout, QFrame
+    QVBoxLayout, QHBoxLayout
 )
 
-try:
-    from tflite_runtime.interpreter import Interpreter
-    print("[Info] Using tflite_runtime.Interpreter")
-except ImportError:
-    import tensorflow as tf
-    Interpreter = tf.lite.Interpreter
-    print("[Info] Using tensorflow.lite.Interpreter")
+from ai_edge_litert.interpreter import Interpreter
 
 
 # -----------------------------------------------------------------------------
@@ -68,20 +49,14 @@ MIN_FRAMES = 8
 HANDS_LOST_FRAMES = 15
 LH_START, LH_END = 468, 489
 RH_START, RH_END = 522, 543
-
-CONFIDENCE_THRESHOLD = 0.30   # min prob to add a word to the sentence
+CONFIDENCE_THRESHOLD = 0.30
 
 
 # -----------------------------------------------------------------------------
-# Model wrapper
+# Model
 # -----------------------------------------------------------------------------
 class SignClassifier:
     def __init__(self, model_path, label_map_path, num_threads=4):
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model not found: {model_path}")
-        if not os.path.exists(label_map_path):
-            raise FileNotFoundError(f"Label map not found: {label_map_path}")
-
         self.interpreter = Interpreter(model_path=model_path, num_threads=num_threads)
         self.interpreter.allocate_tensors()
         self.input_details = self.interpreter.get_input_details()
@@ -98,16 +73,13 @@ class SignClassifier:
             sequence = sequence[start:start + MAX_LEN]
 
         self.interpreter.resize_tensor_input(
-            self.input_details[0]["index"], list(sequence.shape)
-        )
+            self.input_details[0]["index"], list(sequence.shape))
         self.interpreter.allocate_tensors()
         self.interpreter.set_tensor(
-            self.input_details[0]["index"], sequence.astype(np.float32)
-        )
+            self.input_details[0]["index"], sequence.astype(np.float32))
         self.interpreter.invoke()
         logits = self.interpreter.get_tensor(
-            self.output_details[0]["index"]
-        ).flatten()
+            self.output_details[0]["index"]).flatten()
 
         probs = np.exp(logits - logits.max())
         probs = probs / probs.sum()
@@ -142,24 +114,36 @@ def hands_visible(results):
 
 
 # -----------------------------------------------------------------------------
-# Worker thread - capture + MediaPipe + inference
-# Emits Qt signals to update the GUI on the main thread.
+# Worker thread
 # -----------------------------------------------------------------------------
 class InferenceThread(QThread):
-    frame_ready    = pyqtSignal(np.ndarray)              # latest BGR frame
-    state_changed  = pyqtSignal(str)                     # waiting/recording/finishing
-    fps_updated    = pyqtSignal(float, int)              # fps, buffer_size
-    result_ready   = pyqtSignal(list, int, float)        # predictions, n_frames, ms
+    frame_ready   = pyqtSignal(np.ndarray)
+    state_changed = pyqtSignal(str)
+    fps_updated   = pyqtSignal(float)
+    result_ready  = pyqtSignal(list, int)   # predictions, n_frames
 
-    def __init__(self, classifier, complexity=1, width=640, height=480):
+    def __init__(self, classifier, complexity=1, width=640, height=480, rotate=0):
         super().__init__()
         self.classifier = classifier
         self.width = width
         self.height = height
         self.complexity = complexity
+        self.rotate = rotate
         self.running = False
         self.state = "waiting"
         self._cancel_requested = False
+
+    @staticmethod
+    def _stats(arr):
+        """Return (min, mean, p50, p95, max) for a list of numbers in ms."""
+        if not arr:
+            return (0.0,) * 5
+        a = np.asarray(arr)
+        return (float(a.min()),
+                float(a.mean()),
+                float(np.percentile(a, 50)),
+                float(np.percentile(a, 95)),
+                float(a.max()))
 
     def run(self):
         mp_holistic = mp.solutions.holistic
@@ -174,30 +158,58 @@ class InferenceThread(QThread):
 
         picam2 = Picamera2()
         config = picam2.create_preview_configuration(
-            main={"size": (self.width, self.height), "format": "RGB888"}
-        )
+            main={"size": (self.width, self.height), "format": "RGB888"})
         picam2.configure(config)
         picam2.start()
         time.sleep(1.0)
 
         sequence_buffer = deque(maxlen=MAX_LEN)
         hands_lost = 0
-        fps_history = deque(maxlen=30)
+        fps_history = deque(maxlen=30)        # for the smoothed UI FPS
+
+        # ---- Performance tracking ----
+        # Frame-level metrics, rolling window of last 200 frames
+        mediapipe_ms_window = deque(maxlen=200)
+        loop_ms_window      = deque(maxlen=200)
+        # Inference latency, last 50 inferences
+        inference_ms_window = deque(maxlen=50)
+
+        # 5-second interval reporting
+        report_interval_sec = 5.0
+        report_start_time   = time.time()
+        report_frame_count  = 0
+
+        # Cumulative
+        total_start = time.time()
+        total_frames = 0
 
         self.running = True
         try:
             while self.running:
-                t0 = time.time()
+                t_loop_start = time.time()
 
                 frame_bgr = picam2.capture_array()
+
+                if self.rotate == 90:
+                    frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+                elif self.rotate == 180:
+                    frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_180)
+                elif self.rotate == 270:
+                    frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
                 frame_bgr = cv2.flip(frame_bgr, 1)
 
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 frame_rgb.flags.writeable = False
+
+                # --- Time MediaPipe ---
+                t_mp_start = time.time()
                 results = holistic.process(frame_rgb)
+                mp_ms = (time.time() - t_mp_start) * 1000.0
+                mediapipe_ms_window.append(mp_ms)
+
                 frame_rgb.flags.writeable = True
 
-                # Handle cancel from UI thread
                 if self._cancel_requested:
                     sequence_buffer.clear()
                     hands_lost = 0
@@ -207,7 +219,6 @@ class InferenceThread(QThread):
 
                 has_hand = hands_visible(results)
 
-                # ---- State machine ----
                 if self.state == "waiting":
                     if has_hand:
                         sequence_buffer.clear()
@@ -240,24 +251,33 @@ class InferenceThread(QThread):
                             n = len(sequence_buffer)
                             if n >= MIN_FRAMES:
                                 seq = np.stack(list(sequence_buffer), axis=0)
-                                t_inf = time.time()
-                                preds = self.classifier.predict(seq, top_k=3)
-                                inf_ms = (time.time() - t_inf) * 1000
 
-                                print(f"[Inference] {n} frames, {inf_ms:.1f} ms")
+                                # --- Time TFLite inference ---
+                                t_inf_start = time.time()
+                                preds = self.classifier.predict(seq, top_k=3)
+                                inf_ms = (time.time() - t_inf_start) * 1000.0
+                                inference_ms_window.append(inf_ms)
+
+                                print(f"\n[Inference] {n} frames, {inf_ms:.1f} ms")
                                 for name, prob in preds:
                                     print(f"  {name:25s} {prob*100:5.1f}%")
+                                # Show recent inference stats
+                                imn, ime, ip50, ip95, imx = self._stats(
+                                    list(inference_ms_window))
+                                print(f"[Inference stats, last {len(inference_ms_window)}]: "
+                                      f"min={imn:.1f}  mean={ime:.1f}  "
+                                      f"p50={ip50:.1f}  p95={ip95:.1f}  max={imx:.1f} ms")
+                                print()
 
-                                self.result_ready.emit(preds, n, inf_ms)
+                                self.result_ready.emit(preds, n)
                             else:
-                                print(f"[Auto] discarded short ({n} frames)")
-
+                                print(f"[Auto] discarded short ({n})")
                             sequence_buffer.clear()
                             hands_lost = 0
                             self.state = "waiting"
                             self.state_changed.emit("waiting")
 
-                # Draw landmarks on preview frame
+                # Draw landmarks on preview
                 mp_drawing.draw_landmarks(
                     frame_bgr, results.left_hand_landmarks,
                     mp_holistic.HAND_CONNECTIONS,
@@ -271,14 +291,71 @@ class InferenceThread(QThread):
 
                 self.frame_ready.emit(frame_bgr)
 
-                dt = max(time.time() - t0, 1e-6)
+                # Total loop time for this frame
+                loop_ms = (time.time() - t_loop_start) * 1000.0
+                loop_ms_window.append(loop_ms)
+
+                dt = max(time.time() - t_loop_start, 1e-6)
                 fps_history.append(1.0 / dt)
-                fps = sum(fps_history) / len(fps_history)
-                self.fps_updated.emit(fps, len(sequence_buffer))
+                self.fps_updated.emit(sum(fps_history) / len(fps_history))
+
+                report_frame_count += 1
+                total_frames += 1
+
+                # ---- Periodic 5-second report ----
+                now = time.time()
+                if now - report_start_time >= report_interval_sec:
+                    interval = now - report_start_time
+                    avg_fps_5s = report_frame_count / interval
+
+                    mp_min, mp_mean, mp_p50, mp_p95, mp_max = self._stats(
+                        list(mediapipe_ms_window))
+                    lp_min, lp_mean, lp_p50, lp_p95, lp_max = self._stats(
+                        list(loop_ms_window))
+
+                    total_elapsed = now - total_start
+                    avg_fps_total = total_frames / max(total_elapsed, 1e-6)
+
+                    print(f"[Perf @ {total_elapsed:6.1f}s] "
+                          f"FPS_5s={avg_fps_5s:5.2f}  FPS_avg={avg_fps_total:5.2f}  "
+                          f"frames={total_frames}")
+                    print(f"  MediaPipe ms: min={mp_min:5.1f}  mean={mp_mean:5.1f}  "
+                          f"p50={mp_p50:5.1f}  p95={mp_p95:5.1f}  max={mp_max:5.1f}")
+                    print(f"  Loop      ms: min={lp_min:5.1f}  mean={lp_mean:5.1f}  "
+                          f"p50={lp_p50:5.1f}  p95={lp_p95:5.1f}  max={lp_max:5.1f}")
+
+                    report_start_time = now
+                    report_frame_count = 0
 
         finally:
             picam2.stop()
             holistic.close()
+
+            # ---- Final summary ----
+            total_elapsed = time.time() - total_start
+            avg_fps_total = total_frames / max(total_elapsed, 1e-6)
+            print("\n" + "=" * 60)
+            print("[Perf Final Summary]")
+            print(f"  Total runtime: {total_elapsed:.1f} s")
+            print(f"  Total frames:  {total_frames}")
+            print(f"  Average FPS:   {avg_fps_total:.2f}")
+
+            if mediapipe_ms_window:
+                mp_stats = self._stats(list(mediapipe_ms_window))
+                print(f"  MediaPipe ms (last {len(mediapipe_ms_window)}): "
+                      f"min={mp_stats[0]:.1f}  mean={mp_stats[1]:.1f}  "
+                      f"p50={mp_stats[2]:.1f}  p95={mp_stats[3]:.1f}  max={mp_stats[4]:.1f}")
+            if loop_ms_window:
+                lp_stats = self._stats(list(loop_ms_window))
+                print(f"  Loop      ms (last {len(loop_ms_window)}): "
+                      f"min={lp_stats[0]:.1f}  mean={lp_stats[1]:.1f}  "
+                      f"p50={lp_stats[2]:.1f}  p95={lp_stats[3]:.1f}  max={lp_stats[4]:.1f}")
+            if inference_ms_window:
+                inf_stats = self._stats(list(inference_ms_window))
+                print(f"  Inference ms (n={len(inference_ms_window)}): "
+                      f"min={inf_stats[0]:.1f}  mean={inf_stats[1]:.1f}  "
+                      f"p50={inf_stats[2]:.1f}  p95={inf_stats[3]:.1f}  max={inf_stats[4]:.1f}")
+            print("=" * 60)
 
     def stop(self):
         self.running = False
@@ -289,26 +366,21 @@ class InferenceThread(QThread):
 
 
 # -----------------------------------------------------------------------------
-# Main GUI window
+# Main window
 # -----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
-    def __init__(self, classifier, complexity, width, height, fullscreen):
+    def __init__(self, classifier, complexity, width, height, rotate, fullscreen):
         super().__init__()
-        self.setWindowTitle("ASL Sign Recognition")
-        self._apply_stylesheet()
+        self.setWindowTitle("ASL")
+        self.sentence_words = []
 
-        self.sentence_words = []   # accumulated recognized words
-
-        # Banner timer - hides the result after a few seconds
         self.banner_timer = QTimer(self)
         self.banner_timer.setSingleShot(True)
         self.banner_timer.timeout.connect(self._fade_result)
 
-        # Build UI
         self._build_ui()
 
-        # Worker thread
-        self.thread = InferenceThread(classifier, complexity, width, height)
+        self.thread = InferenceThread(classifier, complexity, width, height, rotate)
         self.thread.frame_ready.connect(self._on_frame)
         self.thread.state_changed.connect(self._on_state)
         self.thread.fps_updated.connect(self._on_fps)
@@ -318,225 +390,82 @@ class MainWindow(QMainWindow):
         if fullscreen:
             self.showFullScreen()
         else:
-            self.resize(900, 760)
+            self.resize(800, 480)
 
-    # ------------- Style -------------
-    def _apply_stylesheet(self):
+    def _build_ui(self):
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #0d1117; color: #e6edf3; }
-
-            QLabel#StatusPill {
-                background: rgba(63, 185, 80, 50);
-                color: #3fb950;
-                border: 2px solid #3fb950;
-                border-radius: 18px;
-                padding: 6px 18px;
-                font-weight: 700;
-                font-size: 13px;
-            }
-            QLabel#StatusPill[state="recording"] {
-                background: rgba(248, 81, 73, 60);
-                color: #f85149;
-                border-color: #f85149;
-            }
-            QLabel#StatusPill[state="finishing"] {
-                background: rgba(240, 165, 0, 60);
-                color: #f0a500;
-                border-color: #f0a500;
-            }
-
-            QLabel#FpsLabel {
-                background: #161b22;
-                color: #8b949e;
-                border-radius: 8px;
-                padding: 5px 14px;
-                font-family: monospace;
-                font-size: 12px;
-            }
-
-            QFrame#CenterCard {
-                background: #161b22;
-                border-radius: 16px;
-                border: 1px solid #21262d;
-            }
-            QFrame#CenterCard[active="true"] {
-                border-color: #3fb950;
-            }
-
-            QLabel#CenterWord {
-                color: #ffffff;
-                font-weight: 800;
-                font-size: 80px;
-                letter-spacing: -2px;
-            }
-            QLabel#CenterWordIdle {
-                color: #30363d;
-                font-weight: 800;
-                font-size: 80px;
-                letter-spacing: -2px;
-            }
-
-            QLabel#CenterProb {
-                background: rgba(63, 185, 80, 50);
-                color: #3fb950;
-                border: 1px solid #3fb950;
-                border-radius: 14px;
-                padding: 4px 16px;
-                font-weight: 600;
-                font-size: 16px;
-            }
-
-            QLabel#Runner {
-                background: #161b22;
-                color: #8b949e;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-size: 12px;
-            }
-
-            QFrame#PreviewFrame {
-                background: #161b22;
-                border-radius: 12px;
-                border: 1px solid #21262d;
-            }
-
-            QLabel#SectionHeader {
-                color: #6e7681;
-                font-size: 11px;
-                font-weight: 700;
-                letter-spacing: 1.5px;
-            }
-
-            QLabel#SentenceText {
-                color: #e6edf3;
-                background: #161b22;
-                border-radius: 10px;
-                border: 1px solid #21262d;
-                padding: 14px 16px;
-                font-size: 18px;
-                min-height: 36px;
-            }
-
             QPushButton {
-                background: #21262d;
-                color: #c9d1d9;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-                padding: 8px 16px;
-                font-size: 12px;
-                font-weight: 500;
+                background: #21262d; color: #c9d1d9;
+                border: 1px solid #30363d; border-radius: 6px;
+                padding: 6px 12px; font-size: 13px;
             }
-            QPushButton:hover  { background: #30363d; border-color: #484f58; }
-            QPushButton:pressed { background: #161b22; }
+            QPushButton:hover { background: #30363d; }
         """)
 
-    # ------------- UI construction -------------
-    def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
+
+        # The big preview label - this is the centerpiece
+        self.preview = QLabel()
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setStyleSheet("background: #000;")
+        self.preview.setMinimumSize(640, 360)
+
+        # Overlay labels - drawn on top of the preview
+        # Status pill (top-left)
+        self.status_label = QLabel("● WAITING", self.preview)
+        self.status_label.setStyleSheet("""
+            background: rgba(63, 185, 80, 200); color: white;
+            border-radius: 14px; padding: 5px 14px;
+            font-weight: 700; font-size: 13px;
+        """)
+        self.status_label.adjustSize()
+        self.status_label.move(12, 12)
+
+        # FPS (top-right) - position updated in resizeEvent
+        self.fps_label = QLabel("FPS --", self.preview)
+        self.fps_label.setStyleSheet("""
+            background: rgba(0, 0, 0, 180); color: #c9d1d9;
+            border-radius: 8px; padding: 4px 10px;
+            font-family: monospace; font-size: 12px;
+        """)
+
+        # Big result banner (center, hidden until prediction comes in)
+        self.result_banner = QLabel("", self.preview)
+        self.result_banner.setAlignment(Qt.AlignCenter)
+        self.result_banner.setStyleSheet("""
+            background: rgba(0, 0, 0, 200); color: #ffffff;
+            border-radius: 14px; padding: 14px 28px;
+            font-weight: 800; font-size: 42px;
+        """)
+        self.result_banner.hide()
+
+        # Layout: preview takes most of the space, sentence + buttons at bottom
         root = QVBoxLayout(central)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(14)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
 
-        # ---- Top bar: status pill (left) + FPS (right) ----
-        top_bar = QHBoxLayout()
-        self.status_pill = QLabel("● WAITING")
-        self.status_pill.setObjectName("StatusPill")
-        self.status_pill.setProperty("state", "waiting")
+        root.addWidget(self.preview, stretch=1)
 
-        self.fps_label = QLabel("FPS --   0 frames")
-        self.fps_label.setObjectName("FpsLabel")
-
-        top_bar.addWidget(self.status_pill)
-        top_bar.addStretch()
-        top_bar.addWidget(self.fps_label)
-        root.addLayout(top_bar)
-
-        # ---- Center: big word + prob + runners-up ----
-        self.center_card = QFrame()
-        self.center_card.setObjectName("CenterCard")
-        self.center_card.setProperty("active", "false")
-        center_layout = QVBoxLayout(self.center_card)
-        center_layout.setContentsMargins(20, 24, 20, 24)
-        center_layout.setSpacing(12)
-        center_layout.setAlignment(Qt.AlignCenter)
-
-        self.center_word = QLabel("—")
-        self.center_word.setObjectName("CenterWordIdle")
-        self.center_word.setAlignment(Qt.AlignCenter)
-        center_layout.addWidget(self.center_word)
-
-        self.center_prob = QLabel("waiting for sign...")
-        self.center_prob.setObjectName("CenterProb")
-        self.center_prob.setAlignment(Qt.AlignCenter)
-        self.center_prob.setStyleSheet(
-            "background: #161b22; color: #6e7681; border: 1px solid #21262d;"
-        )
-        # Make it shrink-wrap to text
-        self.center_prob.setSizePolicy(self.center_prob.sizePolicy().Maximum,
-                                       self.center_prob.sizePolicy().Fixed)
-        prob_wrap = QHBoxLayout()
-        prob_wrap.addStretch()
-        prob_wrap.addWidget(self.center_prob)
-        prob_wrap.addStretch()
-        center_layout.addLayout(prob_wrap)
-
-        # Runners (top-2, top-3)
-        runners_wrap = QHBoxLayout()
-        runners_wrap.setSpacing(8)
-        runners_wrap.addStretch()
-        self.runner2 = QLabel("")
-        self.runner3 = QLabel("")
-        self.runner2.setObjectName("Runner")
-        self.runner3.setObjectName("Runner")
-        self.runner2.hide()
-        self.runner3.hide()
-        runners_wrap.addWidget(self.runner2)
-        runners_wrap.addWidget(self.runner3)
-        runners_wrap.addStretch()
-        center_layout.addLayout(runners_wrap)
-
-        root.addWidget(self.center_card, stretch=2)
-
-        # ---- Camera preview (smaller) ----
-        preview_header = QLabel("CAMERA")
-        preview_header.setObjectName("SectionHeader")
-        root.addWidget(preview_header)
-
-        self.preview_frame = QFrame()
-        self.preview_frame.setObjectName("PreviewFrame")
-        prev_layout = QVBoxLayout(self.preview_frame)
-        prev_layout.setContentsMargins(8, 8, 8, 8)
-
-        self.preview_label = QLabel()
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(220)
-        self.preview_label.setMaximumHeight(280)
-        prev_layout.addWidget(self.preview_label)
-
-        root.addWidget(self.preview_frame, stretch=2)
-
-        # ---- Sentence builder ----
-        sentence_header = QLabel("SENTENCE")
-        sentence_header.setObjectName("SectionHeader")
-        root.addWidget(sentence_header)
-
-        self.sentence_label = QLabel("")
-        self.sentence_label.setObjectName("SentenceText")
-        self.sentence_label.setWordWrap(True)
-        self.sentence_label.setText(
-            "<i style='color:#484f58;'>Recognized words will appear here...</i>"
-        )
+        # Sentence row
+        self.sentence_label = QLabel("—")
+        self.sentence_label.setStyleSheet("""
+            background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+            padding: 8px 12px; font-size: 16px; color: #8b949e;
+        """)
+        self.sentence_label.setMinimumHeight(36)
+        self.sentence_label.setMaximumHeight(50)
         root.addWidget(self.sentence_label)
 
         # Buttons row
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
+        btn_row.setSpacing(6)
 
-        self.btn_cancel = QPushButton("Cancel recording")
-        self.btn_cancel.clicked.connect(self._cancel_recording)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(lambda: self.thread.request_cancel())
 
-        self.btn_back = QPushButton("⌫ Backspace")
+        self.btn_back = QPushButton("⌫")
         self.btn_back.clicked.connect(self._sentence_backspace)
 
         self.btn_clear = QPushButton("Clear")
@@ -549,126 +478,106 @@ class MainWindow(QMainWindow):
         self.btn_quit.clicked.connect(self.close)
 
         btn_row.addWidget(self.btn_cancel)
-        btn_row.addStretch()
         btn_row.addWidget(self.btn_back)
         btn_row.addWidget(self.btn_clear)
         btn_row.addWidget(self.btn_copy)
+        btn_row.addStretch()
         btn_row.addWidget(self.btn_quit)
         root.addLayout(btn_row)
 
-    # ------------- Slots: receive signals from worker -------------
+    # ---- Resize: keep overlay labels positioned correctly ----
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reposition_overlays()
+
+    def _reposition_overlays(self):
+        pw = self.preview.width()
+        ph = self.preview.height()
+
+        # FPS to top-right
+        self.fps_label.adjustSize()
+        self.fps_label.move(pw - self.fps_label.width() - 12, 12)
+
+        # Result banner centered
+        self.result_banner.adjustSize()
+        bx = (pw - self.result_banner.width()) // 2
+        by = (ph - self.result_banner.height()) // 2
+        self.result_banner.move(bx, by)
+
+    # ---- Slots ----
     def _on_frame(self, frame_bgr):
-        """Update the preview image."""
         h, w, _ = frame_bgr.shape
-        # Convert BGR -> RGB for QImage
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        # Scale to fill the preview area while keeping aspect ratio
         pix = QPixmap.fromImage(qimg).scaled(
-            self.preview_label.width(),
-            self.preview_label.height(),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self.preview_label.setPixmap(pix)
+            self.preview.width(), self.preview.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.preview.setPixmap(pix)
 
     def _on_state(self, state):
-        """Update the status pill."""
-        self.status_pill.setProperty("state", state)
-        self.status_pill.style().unpolish(self.status_pill)
-        self.status_pill.style().polish(self.status_pill)
+        if state == "waiting":
+            self.status_label.setText("● WAITING")
+            self.status_label.setStyleSheet("""
+                background: rgba(63, 185, 80, 200); color: white;
+                border-radius: 14px; padding: 5px 14px;
+                font-weight: 700; font-size: 13px;
+            """)
+        elif state == "recording":
+            self.status_label.setText("● RECORDING")
+            self.status_label.setStyleSheet("""
+                background: rgba(248, 81, 73, 220); color: white;
+                border-radius: 14px; padding: 5px 14px;
+                font-weight: 700; font-size: 13px;
+            """)
+        elif state == "finishing":
+            self.status_label.setText("● RELEASING")
+            self.status_label.setStyleSheet("""
+                background: rgba(240, 165, 0, 220); color: white;
+                border-radius: 14px; padding: 5px 14px;
+                font-weight: 700; font-size: 13px;
+            """)
+        self.status_label.adjustSize()
 
-        labels = {
-            "waiting":   "● WAITING",
-            "recording": "● RECORDING",
-            "finishing": "● RELEASING",
-        }
-        self.status_pill.setText(labels.get(state, state.upper()))
+    def _on_fps(self, fps):
+        self.fps_label.setText(f"FPS {fps:4.1f}")
+        self._reposition_overlays()
 
-    def _on_fps(self, fps, buffer_size):
-        self.fps_label.setText(f"FPS {fps:4.1f}   {buffer_size:3d} frames")
-
-    def _on_result(self, predictions, n_frames, ms):
-        """Show the big result and add to sentence."""
+    def _on_result(self, predictions, n_frames):
         if not predictions:
             return
         top_word, top_prob = predictions[0]
 
-        # Big center display
-        self.center_word.setObjectName("CenterWord")
-        self.center_word.setStyleSheet("color: #ffffff;")  # ensure refresh
-        self.center_word.setText(top_word)
+        # Show big banner over preview
+        self.result_banner.setText(f"{top_word}   {top_prob*100:.0f}%")
+        self.result_banner.adjustSize()
+        self._reposition_overlays()
+        self.result_banner.show()
 
-        self.center_prob.setStyleSheet(
-            "background: rgba(63, 185, 80, 50); color: #3fb950; "
-            "border: 1px solid #3fb950; border-radius: 14px; "
-            "padding: 4px 16px; font-weight: 600; font-size: 16px;"
-        )
-        self.center_prob.setText(f"{top_prob*100:.0f}%   ·   {n_frames} frames")
-
-        # Runners-up
-        if len(predictions) > 1:
-            r2_word, r2_prob = predictions[1]
-            self.runner2.setText(f"{r2_word}  {r2_prob*100:.0f}%")
-            self.runner2.show()
-        else:
-            self.runner2.hide()
-
-        if len(predictions) > 2:
-            r3_word, r3_prob = predictions[2]
-            self.runner3.setText(f"{r3_word}  {r3_prob*100:.0f}%")
-            self.runner3.show()
-        else:
-            self.runner3.hide()
-
-        # Highlight center card
-        self.center_card.setProperty("active", "true")
-        self.center_card.style().unpolish(self.center_card)
-        self.center_card.style().polish(self.center_card)
-
-        # Add to sentence if confidence is high enough
+        # Add to sentence
         if top_prob >= CONFIDENCE_THRESHOLD:
             self.sentence_words.append(top_word)
             self._refresh_sentence()
 
-        # Schedule fade-out after 4 seconds
-        self.banner_timer.start(4000)
+        self.banner_timer.start(2500)
 
     def _fade_result(self):
-        """Reset center to idle look."""
-        self.center_word.setObjectName("CenterWordIdle")
-        self.center_word.setStyleSheet("color: #30363d;")
-        self.center_word.setText("—")
-        self.center_prob.setStyleSheet(
-            "background: #161b22; color: #6e7681; "
-            "border: 1px solid #21262d; border-radius: 14px; "
-            "padding: 4px 16px; font-size: 14px;"
-        )
-        self.center_prob.setText("waiting for sign...")
-        self.runner2.hide()
-        self.runner3.hide()
+        self.result_banner.hide()
 
-        self.center_card.setProperty("active", "false")
-        self.center_card.style().unpolish(self.center_card)
-        self.center_card.style().polish(self.center_card)
-
-    def reset_center(self):
-        self._fade_result()
-
-    # ------------- Sentence operations -------------
+    # ---- Sentence ----
     def _refresh_sentence(self):
         if not self.sentence_words:
-            self.sentence_label.setText(
-                "<i style='color:#484f58;'>Recognized words will appear here...</i>"
-            )
-            return
-        # Render words as "chips" with HTML (Qt label supports basic HTML)
-        chips = []
-        for w in self.sentence_words:
-            chips.append(
-                f'<span style="background:#21262d; color:#e6edf3; '
-                f'padding:3px 10px; border-radius:6px; margin:2px;">'
-                f'{w}</span>'
-            )
-        self.sentence_label.setText(" ".join(chips))
+            self.sentence_label.setText("—")
+            self.sentence_label.setStyleSheet("""
+                background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+                padding: 8px 12px; font-size: 16px; color: #484f58;
+            """)
+        else:
+            self.sentence_label.setText(" ".join(self.sentence_words))
+            self.sentence_label.setStyleSheet("""
+                background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+                padding: 8px 12px; font-size: 16px; color: #e6edf3;
+            """)
 
     def _sentence_backspace(self):
         if self.sentence_words:
@@ -683,22 +592,17 @@ class MainWindow(QMainWindow):
         text = " ".join(self.sentence_words)
         if text:
             QApplication.clipboard().setText(text)
-            # Brief visual hint
             old = self.btn_copy.text()
-            self.btn_copy.setText("✓ Copied")
-            QTimer.singleShot(1200, lambda: self.btn_copy.setText(old))
+            self.btn_copy.setText("✓")
+            QTimer.singleShot(1000, lambda: self.btn_copy.setText(old))
 
-    def _cancel_recording(self):
-        self.thread.request_cancel()
-
-    # ------------- Cleanup -------------
     def closeEvent(self, event):
         self.thread.stop()
         super().closeEvent(event)
 
 
 # -----------------------------------------------------------------------------
-# Entry point
+# Entry
 # -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -708,21 +612,21 @@ def main():
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--complexity", type=int, default=1, choices=[0, 1, 2])
+    parser.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+                        help="Rotate camera frame in degrees")
     parser.add_argument("--fullscreen", action="store_true")
     args = parser.parse_args()
 
     classifier = SignClassifier(args.model, args.map, args.threads)
 
     app = QApplication(sys.argv)
-    win = MainWindow(
-        classifier,
-        complexity=args.complexity,
-        width=args.width,
-        height=args.height,
-        fullscreen=args.fullscreen,
-    )
+    win = MainWindow(classifier,
+                     complexity=args.complexity,
+                     width=args.width,
+                     height=args.height,
+                     rotate=args.rotate,
+                     fullscreen=args.fullscreen)
     win.show()
-
     sys.exit(app.exec_())
 
 

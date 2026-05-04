@@ -1,0 +1,12 @@
+sudo apt update
+sudo apt install -y python3-pip python3-opencv python3-picamera2
+
+python3 -m venv asl --system-site-packages
+source asl/bin/activate
+
+pip install ai-edge-litert
+# pip install tflite-runtime
+sudo apt install -y python3-pyqt5
+
+DISPLAY=:0 python asl_inference_pi.py
+DISPLAY=:0 python asl_qt_gui.py --fullscreen
